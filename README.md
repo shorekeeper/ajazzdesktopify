@@ -1059,6 +1059,313 @@ When the user clicks "Apply" to save per-key color changes, the driver automatic
 
 ---
 
+## 14. Extended Firmware Analysis
+
+### 14.1. Full Flash Dump Coverage
+
+Two overlapping dumps were obtained and merged to cover flash addresses `0x9000–0x1B5FF` (75,264 bytes):
+
+| Dump | CMD | Flash range | Size |
+|------|-----|-------------|------|
+| `dump_cmd10.bin` | 0x10 (base `0x9000`) | `0x9000–0x18FFF` | 64 KB |
+| `firmware.bin` | 0x17 (base `0xB600`) | `0xB600–0x1B5FF` | 64 KB |
+| `flash_full.bin` | merged | `0x9000–0x1B5FF` | 73.5 KB |
+
+The merged dump was loaded into IDA Pro 8.5 with base address `0x9000`, ARM Thumb mode. IDA's auto-analysis identified 74 functions larger than 50 bytes in the code region.
+
+### 14.2. IDA Project Setup
+
+The following memory segments were created for proper cross-referencing:
+
+| Segment | Start | End | Purpose |
+|---------|-------|-----|---------|
+| `seg000` | `0x9000` | `0x1B600` | Flash dump (code + data) |
+| `SRAM` | `0x20000000` | `0x20008000` | 32 KB chip RAM (names only) |
+| `ROM` | `0xFFFF0000` | `0xFFFFA000` | On-chip boot ROM API |
+| `LOWFLASH` | `0x0000` | `0x9000` | Unreachable code (names only) |
+
+56 addresses were named across all segments, covering HID buffers, LED state pointers, hardware registers, and LOWFLASH function entry points.
+
+### 14.3. Decompiled Functions
+
+Ten functions were fully decompiled and annotated. The complete annotated C reconstruction is in `docs/firmware_reversed.c`.
+
+| Address | Size | Name | Role |
+|---------|------|------|------|
+| `0xBA00` | 304B | `rgb_led_update` | LED frame update — palette + per-key colors |
+| `0xBDA0` | 376B | `keyboard_timer_handler` | GPIO timing, LED countdown timers |
+| `0xC22C` | 72B | `led_buffer_fill_cycle` | Blink ON/OFF for 126-byte LED buffer |
+| `0xC614` | 102B | `led_gamma_update` | 96-step gamma LUT, 34×3 LEDs |
+| `0xD398` | 52B | `gpio_timer_tick` | GPIO pin release countdown |
+| `0xD504` | 1290B | `hid_command_dispatcher` | Complete HID protocol — read/write/system/reset |
+| `0xDFF4` | 24B | `reload_device_config` | Load 6 flash bytes into SRAM config |
+| `0xE1F8` | 192B | `main_loop_tick` | Main loop — dispatches key/LED/timer flags |
+| `0x11FAC` | 162B | `key_action_state_machine` | Queued key actions with bitfield dispatch |
+| `0xC27C` | 80B | `led_commit_wrapper` | Wrapper to LOWFLASH LED commit |
+
+### 14.4. LOWFLASH Functions (Unreachable Code)
+
+The lower 36 KB of flash (`0x0000–0x8FFF`) contains the core firmware: ADC key scanning, threshold comparison, USB device stack, and LED DMA driver. This region is NOT accessible via the HID read overflow vulnerability because all read commands have flash base addresses ≥ `0x9000`.
+
+Entry points were identified by tracing `BL`/`BLX` instructions from decompiled functions in the readable region. 69 functions in our dump call into LOWFLASH.
+
+| Address | Name | Evidence |
+|---------|------|----------|
+| `0x0260` | `sram_memcpy` | Called 15× from dispatcher and USB code |
+| `0x0292` | `sram_operation` | Called 12× — likely memset/clear |
+| `0x1094` | `reload_led_state_from_flash` | Called after CMD 0x23 write |
+| `0x1284` | `macro_key_step_execute` | Called from key_action_state_machine |
+| `0x1670` | `hw_peripheral_init` | Called from sub_E1F8 |
+| `0x1770` | `usb_device_init` | Called 3× from USB connection init |
+| `0x24AC` | `enter_firmware_update_mode` | Called by CMD 0x65 — **DANGEROUS** |
+| `0x2500` | `led_buffer_init` | Called from led_buffer_fill_cycle |
+| `0x4154` | `gpio_pin_release_handler` | Called from gpio_timer_tick |
+| `0x4A44` | `flash_write_sector` | Called 26× from dispatcher — main flash API |
+| `0x5114` | `key_interrupt_handler` | ADC scan complete ISR |
+| `0x6A90` | `usb_remote_wakeup` | Called when keys pressed during USB suspend |
+| `0x6F98` | `key_hid_report_send` | Assembles + sends HID keyboard report |
+| `0x6FBC` | `led_commit_to_hardware` | Pushes LED buffers to DMA |
+| `0x7320` | `static_led_handler` | Handles LED effects with anim_type < 8 |
+| `0x73EC` | `led_effect_step` | Single animation step |
+| `0x7500` | `periodic_key_handler` | Timer-based key debounce + repeat |
+| `0x7794` | `flash_post_write_handler` | Called after multi-sector flash writes |
+| `0x7FFE` | `hw_watchdog_or_reset` | System reset/watchdog |
+
+### 14.5. LED State Persistence Discovery
+
+A key finding from the firmware analysis: CMD `0x23` (LED State write) targets flash address `0x9800`, not just SRAM. This was verified by reading flash `0x9800` via CMD `0x11` with offset `0x0600`:
+
+```
+TX: AA 11 38 00 06 00 00 00  ...
+RX: 55 11 38 00 06 00 00 00  03 FF FF FF 00 00 00 00  01 05 03 00 ...
+```
+
+The response matches the `LedStateRegister` struct: effect `0x03` (internal encoding), brightness 5, speed 3, engine ON.
+
+After writing to flash `0x9800`, the dispatcher calls `reload_led_state_from_flash()` (LOWFLASH `0x1094`) to update the live SRAM values, making effect changes immediate AND persistent across power cycles.
+
+### 14.6. Effect ID Internal Encoding
+
+The firmware uses a different internal effect numbering than the wire protocol. The CMD `0x13` read handler applies a transformation:
+
+```c
+// Internal -> Wire conversion (CMD 0x13 read)
+wire_id = (internal < 0x0B) ? internal + 1 : internal;
+```
+
+| Wire (CMD 0x13/0x23) | Internal (flash/SRAM) | Effect |
+|---|---|---|
+| 0x01 | 0x00 | Solid Color |
+| 0x02 | 0x01 | Keypress Light |
+| 0x03 | 0x02 | Breathing |
+| ... | ... | ... |
+| 0x0A | 0x09 | Top-Down Wave |
+| 0x0B | 0x0A | Color Pulse Wave |
+| 0x0C | 0x0C | Rainbow Rotation (no shift at ≥ 0x0B) |
+| 0x14 | 0x14 | Custom Per-Key |
+
+The animation type byte (`g_led_anim_type_ptr`) uses a separate classification:
+- `< 8`: Static effects -> color from LUT, engine OFF
+- `≥ 8`: Animated effects -> flags `0xFF`, engine ON
+- `0xFF`: Custom Per-Key mode
+
+### 14.7. LED Rendering Pipeline
+
+The LED subsystem consists of three layers:
+
+```
+Layer 1: Color Selection (rgb_led_update @ 0xBA00)
+  ├─ Animated effects: palette[key * 3] -> progressive, one key/frame
+  ├─ Static effects: dispatched to LOWFLASH 0x7320
+  └─ Custom Per-Key (0xFF): per-key data from state[+52]
+       ├─ per_key.use_palette -> animation palette colors
+       └─ !use_palette -> per_key.R/G/B custom colors
+
+Layer 2: Gamma Correction (led_gamma_update @ 0xC614)
+  ├─ 34 LED groups × 3 physical LEDs = 102 total
+  ├─ 96-step phase counter per group
+  ├─ Gamma LUT at flash 0x135C2 (96 entries)
+  └─ Direction flag: brightening (up) or dimming (down)
+
+Layer 3: Hardware Output
+  ├─ Three separate DMA buffers: R, G, B (g_led_buf_R/G/B)
+  ├─ Alpha/enable buffer (g_led_buf_alpha, 0xFF = on)
+  ├─ LED routing table at 0x1385D (12 entries per key)
+  └─ PWM output buffer at 0x20004A3A -> LED driver DMA
+```
+
+### 14.8. Key Processing Pipeline
+
+Key scanning is entirely in LOWFLASH. The boundary between unreachable and reversed code is defined by three SRAM flags:
+
+```
+┌─────────────── LOWFLASH (not readable) ───────────────┐
+│ ADC -> Hall sensors -> Compare thresholds -> Debounce    │
+│ Sets flags in SRAM:                                    │
+│   0x20000076 = key_interrupt (ADC done)                │
+│   0x20000077 = periodic_tick (timer)                   │
+│   0x20000078 = key_state_update (state changed)        │
+└──────────────────────┬────────────────────────────────┘
+                       ▼
+┌──────────── Our dump (fully reversed) ────────────────┐
+│ 0xE1F8 main_loop_tick:                                 │
+│   flag_key_interrupt  -> LOWFLASH 0x5114                │
+│   flag_periodic_tick  -> LOWFLASH 0x7500                │
+│   flag_key_state_update -> 0x11FAC state machine        │
+│     bit 0: LED commit                                  │
+│     bit 1: HID report send (LOWFLASH 0x6F98)           │
+│     bit 3: set pending flag                            │
+│     bit 6: flash write (save config)                   │
+│     bits 8-11: macro execution (LOWFLASH 0x1284)       │
+└───────────────────────────────────────────────────────┘
+```
+
+Factory actuation defaults are in ADC counts (not millimeters):
+- Press: 2200 counts (found at flash `0x14714` and `0x14812`)
+- Release: 1500 counts
+- SRAM tables at `0x20002F36` (press) and `0x20003036` (release)
+- Factory flash backup at `0x8400` (press) and `0x8500` (release)
+
+### 14.9. Factory Reset Protocol
+
+The dispatcher handles factory reset when the command byte has low nibble `0xF`. The sub-command byte (`input[2]`) selects what to reset:
+
+| Sub | Scope | Flash regions erased |
+|-----|-------|---------------------|
+| 1 | Keys + Actuation | `0x9600`, `0xB200–B5FF`, `0xB600–B9FF` |
+| 2 | LED + RGB | `0x9800`, `0x9A00`, `0x8200` (factory restore) |
+| 4 | LED Animation | `0x9C00–0xADFF` (9 × 512B sectors) |
+| 5 | Actuation defaults | Writes 2200/1500 to SRAM, saves to `0x8400`/`0x8500` |
+| 0xFF | **Full reset** | All of the above + `0x9200` (config), `0xB000` (unknown) |
+
+### 14.10. Device Config Structure
+
+CMD `0x11` / `0x21` addresses flash `0x9200–0x93FF`. Most of this region is unused (all zeros). The `reload_device_config()` function reads only 6 specific bytes:
+
+| Flash offset | SRAM destination | Purpose |
+|---|---|---|
+| `0x9203` | `g_config_field_mode` | Config mode byte |
+| `0x9205` | `g_config_sram_ptr[5]` | Parameter 1 |
+| `0x9208` | `g_config_sram_ptr[6]` | Parameter 2 |
+| `0x9209` | `g_config_sram_ptr[7]` | Parameter 3 |
+| `0x920B` | `g_config_field_B` | Parameter 4 |
+| `0x920E` | `g_config_field_E` | Parameter 5 |
+
+---
+
+## 15. Firmware Update Mechanism
+
+### 15.1. Protocol Reconstruction
+
+The firmware update mechanism was reconstructed from the HID command dispatcher (Section 14.3) and HID descriptor analysis (Section 3.4):
+
+1. **Enter DFU mode**: Host sends CMD `0x65` on Interface 2. Firmware calls `enter_firmware_update_mode()` at LOWFLASH `0x24AC`. The USB device re-enumerates.
+
+2. **Transfer firmware image**: Host sends 4096-byte blocks via Interface 3 output reports (4097 bytes with report ID). Each block corresponds to one flash page.
+
+3. **Status handshake**: Interface 3's 65-byte feature report serves as a status/handshake buffer. The firmware echoes written data without processing.
+
+4. **Flash commit**: Host sends CMD `0x64` on Interface 2 to finalize.
+
+5. **Exit DFU mode**: Host sends CMD `0x67` to clear the update flag.
+
+### 15.2. Safety Warning
+
+**CMD `0x65` must NEVER be sent without a complete, valid firmware image.** The code at LOWFLASH `0x24AC` is not readable via HID and cannot be verified. Entering DFU mode without proper firmware data will brick the keyboard, requiring hardware JTAG/SWD recovery on the SN32F248B chip.
+
+The keyboard freeze observed during the initial command scan (Section 4.3) was likely caused by CMD `0x64` (flash commit) being sent with an empty payload, writing garbage data to flash.
+
+---
+
+## 16. Chip Identification
+
+The firmware runs on a **Sonix SN32F248B** (or compatible SN32F2xx variant):
+
+- ARM Cortex-M0+ core, Thumb instruction set
+- 128 KB flash (0x00000–0x1FFFF)
+- 32 KB SRAM (0x20000000–0x20007FFF)
+- On-chip boot ROM at 0xFFFF0000+ with flash programming API
+- USB 2.0 Full-Speed device controller at 0x40057000
+- GPIO ports at 0x40038000 (P0), 0x4003A000 (P1)
+- Flash sector size: 512 bytes (confirmed from dispatcher's sector boundary logic)
+
+Evidence:
+- USBD error strings match Sonix USB Device SDK
+- `[OTGPE]` error strings indicate OTG-capable USB peripheral
+- Hardware register addresses match SN32F2xx datasheet
+- Flash write via ROM API at `0xFFFF9444` (Sonix boot ROM convention)
+- Product string "AJAZZ AK680 MAX" at flash `0xF4B0`
+
+---
+
+## 17. Complete Flash Memory Map
+
+```
+Address     Size    Content                          Access
+─────────── ─────── ──────────────────────────────── ──────────────
+0x0000      36 KB   Boot/core firmware               NOT READABLE
+  0x0260              sram_memcpy()
+  0x0292              sram_operation()
+  0x1094              reload_led_state_from_flash()
+  0x1284              macro_key_step_execute()
+  0x1670              hw_peripheral_init()
+  0x1770              usb_device_init()
+  0x24AC              enter_firmware_update_mode()  ← DANGER
+  0x2500              led_buffer_init()
+  0x4154              gpio_pin_release_handler()
+  0x4A44              flash_write_sector()
+  0x5114              key_interrupt_handler()
+  0x6A90              usb_remote_wakeup()
+  0x6F98              key_hid_report_send()
+  0x6FBC              led_commit_to_hardware()
+  0x7320              static_led_handler()
+  0x73EC              led_effect_step()
+  0x7500              periodic_key_handler()
+  0x7794              flash_post_write_handler()
+  0x7FFE              hw_watchdog_or_reset()
+
+0x8200      16B     Factory RGB defaults             Flash write only
+0x8400      256B    Factory press ADC defaults        Flash write only
+0x8500      256B    Factory release ADC defaults      Flash write only
+
+0x9000      512B    DeviceInfo (CMD 0x10)            READ
+  0x9003              Firmware signature byte
+
+0x9200      512B    Device Config (CMD 0x11/0x21)    READ/WRITE
+  0x9203,05,08,09,0B,0E  Config params (6 bytes used)
+
+0x9600      512B    Key Mapping (CMD 0x12/0x22)      READ/WRITE
+0x9800      512B    LED State persist (CMD 0x23)     WRITE (read via 0x13 SRAM)
+0x9A00      512B    Per-key RGB (CMD 0x14/0x24)      READ/WRITE
+0x9C00      4608B   LED Animation (CMD 0x15/0x25)    READ/WRITE  (9×512B)
+0xB000      512B    Unknown table (CMD 0x16/0x26)    READ/WRITE
+0xB200      1024B   Release Actuation (CMD 0x18/0x28) READ/WRITE
+0xB600      1024B   Press Actuation (CMD 0x17/0x27)  READ/WRITE
+
+0xBA00+             Executable code                  READ (via overflow)
+  0xBA00    304B      rgb_led_update
+  0xBDA0    376B      keyboard_timer_handler
+  0xC22C    72B       led_buffer_fill_cycle
+  0xC614    102B      led_gamma_update
+  0xD398    52B       gpio_timer_tick
+  0xD504    1290B     hid_command_dispatcher         ← MAIN PROTOCOL
+  0xDFF4    24B       reload_device_config
+  0xE1F8    192B      main_loop_tick
+  0xEA60    54B       usb_endpoint_alloc
+  0xF448    16B       usb_descriptor_setup
+  0x104B8   868B      usb_fifo_transfer
+  0x113B4   508B      usb_endpoint_config
+  0x11FAC   162B      key_action_state_machine
+
+0x134D2     36B     Animation palette (12×3B RGB)    Data
+0x13552             LED scan order table              Data
+0x135C2     96B     Gamma correction LUT              Data
+0x1385D             LED routing table (12 per key)    Data
+0x14530     16B     "HID Interface3\t" string         Data
+0xF45C      9B      "KEYBOARD" string                 Data
+0xF4B0      16B     "AJAZZ AK680 MAX" string          Data
+```
+
 # AK680 MAX RGB Protocol Quick Reference
 
 ## Wire Format (64-byte interrupt reports, interface 0xFF68)

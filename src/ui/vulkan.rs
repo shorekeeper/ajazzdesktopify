@@ -4,6 +4,13 @@ use crate::ui::draw::{DrawCmd, Vertex};
 use crate::ui::text::{ATLAS_W, ATLAS_H};
 use crate::ui::theme as t;
 
+/// You see, egui probably good. But:
+/// 1) I don't want to see this bullshit in my dependencies.
+/// 2) It's bullshit.
+/// 3) I don't want to use any JS GUI libraries, flsk which looks like Windows 2000, GTK4 (it's good, but requires msys sex)
+/// 4) Egui is a fucking bullshit forcefully stuck on 0.xx instead of stable API on 1.0, because "uhsaudhjsd we're looking oN bEst ArchjiTuicCtureeeeeee" - no, you just fucking suck, egui devs. Fuck you and your changes after any fucking minor patch.
+/// 5) I love Vulkan. It's simple, really.
+/// 
 const MAX_FRAMES: usize = 2;
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv"));
