@@ -1,0 +1,7 @@
+/target
+*.id0
+*.id1
+*.nam
+*.til
+src/code.ps1
+src/all_code.txt
