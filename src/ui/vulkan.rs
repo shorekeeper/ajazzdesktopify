@@ -181,8 +181,8 @@ impl Vk {
             let ptr = dev.map_memory(mem, 0, sz, vk::MemoryMapFlags::empty()).unwrap() as *mut u8;
             GpuBuf { buf, mem, ptr, size: sz }
         };
-        let vb = [mk_dyn_buf(1024 * 1024), mk_dyn_buf(1024 * 1024)];
-        let ib = [mk_dyn_buf(512 * 1024),  mk_dyn_buf(512 * 1024)];
+        let vb = [mk_dyn_buf(4 * 1024 * 1024), mk_dyn_buf(4 * 1024 * 1024)];
+        let ib = [mk_dyn_buf(2 * 1024 * 1024), mk_dyn_buf(2 * 1024 * 1024)];
 
         let ici = vk::ImageCreateInfo::default().image_type(vk::ImageType::TYPE_2D).format(vk::Format::R8_UNORM)
             .extent(vk::Extent3D { width: ATLAS_W, height: ATLAS_H, depth: 1 }).mip_levels(1).array_layers(1)
@@ -317,6 +317,16 @@ impl Vk {
 
         let vb_bytes = std::mem::size_of_val(verts);
         let ib_bytes = std::mem::size_of_val(idxs);
+
+        // Prevent writing past mapped GPU memory
+        if vb_bytes as u64 > self.vb[f].size || ib_bytes as u64 > self.ib[f].size {
+            log::error!(
+                "Draw data exceeds GPU buffer: vtx {vb_bytes} / {}, idx {ib_bytes} / {}",
+                self.vb[f].size, self.ib[f].size
+            );
+            return;
+        }
+
         if vb_bytes > 0 { std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, self.vb[f].ptr, vb_bytes); }
         if ib_bytes > 0 { std::ptr::copy_nonoverlapping(idxs.as_ptr()  as *const u8, self.ib[f].ptr, ib_bytes); }
 
